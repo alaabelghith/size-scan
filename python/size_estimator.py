@@ -1,39 +1,41 @@
 r"""
-Size Scan — Python reference implementation (the version that runs in the
-Fashion Mirror kiosk). Same method as ../src/estimator.js.
+Fashion Mirror — Size Estimator (Phase A, per size_detection_plan.md)
 
-Guided front + side capture -> MediaPipe Pose checks -> body widths from the
-segmentation silhouette -> ellipse circumferences -> size-chart lookup.
+Guided front + profile capture -> MediaPipe Pose QC -> geometric
+measurement estimation -> hardcoded demo size-chart lookup.
 
-STATUS: demo-grade. Not validated against tape-measure ground truth on a
-group of people. Treat results as a starting point.
+STATUS: demo-grade. Not validated against tape-measure ground truth yet.
+2026-10-11: front-view widths now measure the torso only (arms and hands that
+touch the body are cut at the arm's inner edge); before, the silhouette's
+first-to-last pixel included both arms and inflated chest/waist/hips.
+Benchmark on real people before trusting this for a paying client — see
+"Sell-side note" in 6_strategy/Fashion Mirror/size_detection_plan.md.
+Always keep a Skip path in the kiosk flow; try-on must never depend on this.
 
-Why geometric, not a learned model: there is no reliable free model that maps
-a single photo to an absolute garment size. This module estimates
-circumferences from body landmarks plus a segmentation silhouette, then
-buckets them into a size chart with a confidence flag. (The overall approach
-is similar to the MIT-licensed Live-Measurements-Api project.)
+Why geometric, not a learned model: no credible free/local model maps a
+single photo -> absolute garment size (677-participant study: 9.15%
+consistency). This module produces circumference *estimates* from body
+landmarks + a segmentation silhouette, then buckets them into a size
+chart with a confidence flag — same approach as the MIT-licensed
+Live-Measurements-Api reference the plan cites, adapted here.
 
-Front-view widths measure the torso only: arms and hands that touch the body
-are cut at the arm's inner edge (elbow/wrist landmarks), so they do not
-inflate chest, waist or hips.
-
-Setup:
-    pip install "mediapipe==0.10.21" numpy opencv-python
+Setup (once):
+    .venv\Scripts\python.exe -m pip install "mediapipe==0.10.21"
     (pinned: mediapipe 0.10.31+ removed the legacy mp.solutions.pose API
-    this module uses — github.com/google-ai-edge/mediapipe/issues/6204)
+    this module depends on — see github.com/google-ai-edge/mediapipe/issues/6204.
+    run_app.bat checks/installs this automatically.)
 
-Self-test (no camera, pure maths):
-    python size_estimator.py --selftest
+Standalone test (no camera, pure math — safe to run anywhere):
+    .venv\Scripts\python.exe size_estimator.py --selftest
 
-Live guided capture with a webcam:
-    python size_estimator.py --webcam
+Live guided capture (needs webcam, run on the kiosk machine):
+    .venv\Scripts\python.exe size_estimator.py --webcam
 
-As a module:
+Importable (used by app.py):
     from size_estimator import SizeEstimator, recommend_size
-    est = SizeEstimator()
+    est = SizeEstimator()                     # loads MediaPipe Pose once
     if est.available:
-        ok, msg = est.check_pose(frame_rgb, view="front")
+        ok, msg = est.check_pose(frame_bgr, view="front")
         ...
         measurements = est.compute(height_cm=170)
         result = recommend_size(measurements, category="tops")
@@ -59,6 +61,22 @@ VIS_MIN = 0.55  # landmark visibility threshold to trust a point
 # ── Anthropometric constants (rough averages — demo-grade) ──────────────────
 # Eyes sit ~7% of total standing height below the top of the head.
 EYE_TO_TOP_FRACTION = 0.07
+# 2026-11-19 scale fix: the ankle landmark is NOT the floor. Eye height ~93.6% of
+# stature, ankle (malleolus) ~3.9% (ANSUR-type averages) -> eye-to-ankle = 89.7%
+# of stature. Before, 93% was used, which inflated every cm-per-px by ~3.7%.
+EYE_HEIGHT_FRAC = 0.936
+ANKLE_HEIGHT_FRAC = 0.039
+# Cross-sections are rounder-rectangular than an ellipse: a pure ellipse under-reads
+# the chest/hips. Shape factors on top of Ramanujan (tune with sizing.calibration).
+SHAPE_FACTOR = {"chest": 1.06, "waist": 1.02, "hip": 1.05}
+# Plausible depth/width ratios (profile depth vs front width) — outside = bad profile
+# capture (arm in front, half-turned), clamped to the range.
+DEPTH_RATIO = {"chest": (0.58, 0.85), "waist": (0.60, 0.95), "hip": (0.62, 0.88)}
+DEFAULT_DEPTH_RATIO = {"chest": 0.70, "waist": 0.75, "hip": 0.72}
+# Plausible circumference / stature ratios for adults; outside -> clamp + low confidence.
+STATURE_BOUNDS = {"chest": (0.45, 0.78), "waist": (0.36, 0.72), "hip": (0.47, 0.80)}
+# A-pose check: wrists must be at least this far (cm) outside the hip edge.
+ARM_GAP_CM = 10.0
 # Vertical position of chest/waist lines as a fraction of the
 # shoulder->hip span (0 = shoulder line, 1 = hip line).
 CHEST_FRAC = 0.18
@@ -72,28 +90,76 @@ FOREARM_HALF_CM = 3.5
 MAX_GAP_FRAC = 0.004      # background gap (fraction of width) still counted as body
 
 
-# ── Demo size chart (cm) — replace with your brand's chart ─────────────────────
+# ── Hardcoded demo size chart (Phase A — per plan, config-driven in Phase C) ─
 SIZE_CHARTS = {
     "tops": {  # chest circumference, cm
         "S":  (82, 90),
         "M":  (90, 98),
         "L":  (98, 106),
         "XL": (106, 116),
+        "XXL": (116, 128),
     },
     "bottoms": {  # waist primary, hip as tie-breaker, cm
         "S":  {"waist": (66, 74),  "hip": (88, 96)},
         "M":  {"waist": (74, 82),  "hip": (96, 104)},
         "L":  {"waist": (82, 90),  "hip": (104, 112)},
         "XL": {"waist": (90, 100), "hip": (112, 122)},
+        "XXL": {"waist": (100, 114), "hip": (122, 138)},
     },
     "one-pieces": {  # sized on the larger of chest-band / hip-band
         "S":  {"chest": (82, 90),  "hip": (88, 96)},
         "M":  {"chest": (90, 98),  "hip": (96, 104)},
         "L":  {"chest": (98, 106), "hip": (104, 112)},
         "XL": {"chest": (106, 116), "hip": (112, 122)},
+        "XXL": {"chest": (116, 128), "hip": (122, 138)},
     },
 }
-SIZE_ORDER = ["S", "M", "L", "XL"]
+SIZE_ORDER = ["S", "M", "L", "XL", "XXL"]
+GENDER_SIZE_CHARTS = {
+    "women": SIZE_CHARTS,
+    "men": {
+        # 2026-11-20: Primark men's tops chart (chest cm): S 91-96, M 97-102, L 103-108, XL 109-118, XXL 119-124
+        "tops": {"S": (90, 97), "M": (97, 103), "L": (103, 109), "XL": (109, 119), "XXL": (119, 128)},
+        "bottoms": {"S": {"waist": (74, 82), "hip": (90, 98)}, "M": {"waist": (82, 90), "hip": (98, 106)}, "L": {"waist": (90, 98), "hip": (106, 114)}, "XL": {"waist": (98, 108), "hip": (114, 124)}, "XXL": {"waist": (108, 120), "hip": (124, 138)}},
+        "one-pieces": {"S": {"chest": (88, 96), "hip": (90, 98)}, "M": {"chest": (96, 104), "hip": (98, 106)}, "L": {"chest": (104, 112), "hip": (106, 114)}, "XL": {"chest": (112, 120), "hip": (114, 124)}, "XXL": {"chest": (120, 130), "hip": (124, 138)}},
+    },
+}
+
+# Approximate reference-chart waist ranges in cm, expressed as EU garment
+# labels. Brands vary; these are guidance labels, not a universal fit guarantee.
+EU_WOMENS_TROUSER_WAIST = {
+    32: (60, 64), 34: (64, 68), 36: (68, 72),
+    38: (72, 76), 40: (76, 80), 42: (80, 84), 44: (84, 88),
+    46: (88, 92), 48: (92, 98),
+}
+EU_MENS_TROUSER_WAIST = {      # 2026-11-20: FR trouser labels (taille ~ waist/2; Celio 40=80, 44=88, 46=92 cm)
+    36: (70, 74), 38: (74, 78), 40: (78, 82), 42: (82, 86), 44: (86, 90),
+    46: (90, 94), 48: (94, 98), 50: (98, 102), 52: (102, 106), 54: (106, 112),
+}
+
+
+RETAIL_MAX = 48     # Tunisian mass retail labels stop at 48 (Alaa, 2026-11-20); bigger -> "48+"
+
+
+def _pick_numeric_size(value: Optional[float], ranges: dict):
+    if value is None:
+        return None
+    n = min(ranges, key=lambda size: _range_score(value, *ranges[size]))
+    return n if n <= RETAIL_MAX else f"{RETAIL_MAX}+"
+
+
+def recommend_size_set(measurements: dict) -> dict:
+    """Return alpha and numeric reference sizes for both gender charts."""
+    output = {}
+    for gender in ("women", "men"):
+        top = recommend_size(measurements, "tops", gender)
+        bottom = recommend_size(measurements, "bottoms", gender)
+        chart = EU_WOMENS_TROUSER_WAIST if gender == "women" else EU_MENS_TROUSER_WAIST
+        output[gender] = {
+            "tops": top.get("size"), "bottoms_alpha": bottom.get("size"),
+            "trousers_eu": _pick_numeric_size(measurements.get("waist_cm"), chart),
+        }
+    return output
 
 
 # ── Pure math helpers (no MediaPipe dependency — unit-testable) ─────────────
@@ -176,6 +242,10 @@ def _arm_limits(lm: dict, y: float, centre: float, scale: float) -> tuple:
         pts = [lm.get(i) for i in ids]
         if any(p is None or p[2] < 0.3 for p in pts):
             continue
+        # 2026-11-20: the hand hangs ~0.8 forearm below the wrist landmark -> extend the forearm
+        # segment, otherwise hands at hip level were counted as body (hip width +12 cm in the logs)
+        (ex, ey, _), (wx, wy, wv) = pts[1], pts[2]
+        pts = [pts[0], pts[1], (wx + 0.8 * (wx - ex), wy + 0.8 * (wy - ey), wv)]
         for k in range(2):
             (ax, ay, _), (bx, by, _) = pts[k], pts[k + 1]
             if min(ay, by) <= y <= max(ay, by) and by != ay:
@@ -218,10 +288,11 @@ def _pick_from_ranges(value: float, ranges: dict) -> tuple:
     return best, neighbor, dist_to_edge
 
 
-def recommend_size(measurements: dict, category: str) -> dict:
+def recommend_size(measurements: dict, category: str, gender: str = "women") -> dict:
     """measurements: dict with any of chest_cm / waist_cm / hip_cm / quality.
     Returns {size, alternative, confidence, reason, basis}."""
-    chart = SIZE_CHARTS.get(category, SIZE_CHARTS["tops"])
+    charts = GENDER_SIZE_CHARTS.get(gender, SIZE_CHARTS)
+    chart = charts.get(category, charts["tops"])
     quality = measurements.get("quality", "medium")
 
     if category == "bottoms":
@@ -274,7 +345,7 @@ def _no_result(why: str) -> dict:
             "reason": f"Could not estimate size ({why}).", "basis": None}
 
 
-# ── MediaPipe-backed capture + checks (lazy import — never crash the caller) ────
+# ── MediaPipe-backed capture + QC (lazy import — never crash the kiosk) ─────
 @dataclass
 class _FrameData:
     landmarks: dict = field(default_factory=dict)   # idx -> (x_px, y_px, visibility)
@@ -285,7 +356,7 @@ class _FrameData:
 
 class SizeEstimator:
     """Wraps MediaPipe Pose for the two-view guided capture used by
-    a size-capture screen. `available` is False (never raises) if
+    app.py's size-capture screen. `available` is False (never raises) if
     mediapipe isn't installed or fails to load — callers must check it
     and skip straight to the try-on flow."""
 
@@ -294,6 +365,10 @@ class SizeEstimator:
         self._pose = None
         self.front: Optional[_FrameData] = None
         self.profile: Optional[_FrameData] = None
+        self.front_frames: list = []
+        self.profile_frames: list = []
+        self.calib: dict = {}
+        self.auto_height: dict = {}
         try:
             import mediapipe as mp
             self._mp_pose = mp.solutions.pose
@@ -359,9 +434,22 @@ class SizeEstimator:
                 return False, "Face the camera, arms slightly out"
             if shoulder_w < fd.w * 0.10:
                 return False, "Face the camera directly"
+            # arms must not touch the torso (biggest error source: hands at the waist)
+            span_px = max(1.0, abs(lm[LEFT_ANKLE][1] - lm[NOSE][1]))
+            cm_px = 160.0 / span_px            # rough, height-independent enough for a gate
+            hip_l = min(lm[LEFT_HIP][0], lm[RIGHT_HIP][0])
+            hip_r = max(lm[LEFT_HIP][0], lm[RIGHT_HIP][0])
+            hip_half = (hip_r - hip_l) * 0.75     # hip joints sit inside the hip edge
+            cxh = (hip_l + hip_r) / 2.0
+            for wi in (LEFT_WRIST, RIGHT_WRIST):
+                wx, wy, wv = lm[wi]
+                if wv < 0.3:
+                    return False, "Face the camera, arms slightly out"
+                if abs(wx - cxh) - hip_half < ARM_GAP_CM / cm_px:
+                    return False, "Face the camera, arms slightly out"
             return True, "Hold still..."
         else:  # profile
-            if shoulder_w > fd.w * 0.09:
+            if shoulder_w > fd.w * 0.12:      # 2026-11-20: 0.09 rejected big bodies already in profile
                 return False, "Turn 90° to your side"
             if not (lm[LEFT_SHOULDER][2] > VIS_MIN or lm[RIGHT_SHOULDER][2] > VIS_MIN):
                 return False, "Turn 90° to your side"
@@ -371,6 +459,15 @@ class SizeEstimator:
         fd = self._analyze(frame_rgb)
         if fd is None:
             return False
+        return self.add_frame(fd, view)
+
+    def add_frame(self, fd: "_FrameData", view: str) -> bool:
+        """Store an already-analysed frame (multi-frame median, 2026-11-19)."""
+        if fd is None:
+            return False
+        lst = self.front_frames if view == "front" else self.profile_frames
+        lst.append(fd)
+        del lst[:-24]
         if view == "front":
             self.front = fd
         else:
@@ -380,104 +477,174 @@ class SizeEstimator:
     def reset(self):
         self.front = None
         self.profile = None
+        self.front_frames = []
+        self.profile_frames = []
 
-    def compute(self, height_cm: float) -> dict:
-        """Combine the stored front + profile captures into measurements.
-        Returns {} if front capture is missing (minimum requirement)."""
-        if self.front is None:
-            return {}
-
-        f = self.front
-        lm = f.landmarks
+    # ---- per-frame geometry ------------------------------------------------
+    @staticmethod
+    def _scale(lm, height_cm):
         eye_y = (lm[LEFT_EYE][1] + lm[RIGHT_EYE][1]) / 2.0
         ankle_y = (lm[LEFT_ANKLE][1] + lm[RIGHT_ANKLE][1]) / 2.0
-        eye_to_ankle_px = max(1.0, ankle_y - eye_y)
-        total_height_px = eye_to_ankle_px / (1 - EYE_TO_TOP_FRACTION)
-        scale = height_cm / total_height_px  # cm per px, front frame
+        return height_cm * (EYE_HEIGHT_FRAC - ANKLE_HEIGHT_FRAC) / max(1.0, ankle_y - eye_y)
 
-        shoulder_y = (lm[LEFT_SHOULDER][1] + lm[RIGHT_SHOULDER][1]) / 2.0
-        hip_y = (lm[LEFT_HIP][1] + lm[RIGHT_HIP][1]) / 2.0
-        shoulder_w_px = abs(lm[LEFT_SHOULDER][0] - lm[RIGHT_SHOULDER][0])
-        hip_w_px_lm = abs(lm[LEFT_HIP][0] - lm[RIGHT_HIP][0])
+    @staticmethod
+    def _lines(lm):
+        sy = (lm[LEFT_SHOULDER][1] + lm[RIGHT_SHOULDER][1]) / 2.0
+        hy = (lm[LEFT_HIP][1] + lm[RIGHT_HIP][1]) / 2.0
+        sx = (lm[LEFT_SHOULDER][0] + lm[RIGHT_SHOULDER][0]) / 2.0
+        hx = (lm[LEFT_HIP][0] + lm[RIGHT_HIP][0]) / 2.0
+        ys = {"chest": sy + CHEST_FRAC * (hy - sy), "waist": sy + WAIST_FRAC * (hy - sy), "hip": hy}
+        xs = {"chest": sx + CHEST_FRAC * (hx - sx), "waist": sx + WAIST_FRAC * (hx - sx), "hip": hx}
+        return ys, xs
 
-        chest_y = shoulder_y + CHEST_FRAC * (hip_y - shoulder_y)
-        waist_y = shoulder_y + WAIST_FRAC * (hip_y - shoulder_y)
+    def _front_widths(self, f, height_cm):
+        lm = f.landmarks
+        scale = self._scale(lm, height_cm)
+        ys, xs = self._lines(lm)
+        out = {"shoulder": abs(lm[LEFT_SHOULDER][0] - lm[RIGHT_SHOULDER][0]) * scale}
+        if f.mask is None:
+            return None
+        sy = ys["chest"] - CHEST_FRAC * (ys["hip"] - ys["chest"]) / (1 - CHEST_FRAC)   # shoulder line
+        sh = ys["hip"] - sy
+        def w_at(y, frac):
+            c = xs["chest"] + (xs["hip"] - xs["chest"]) * max(0.0, (y - ys["chest"]) / max(1.0, ys["hip"] - ys["chest"]))
+            lo, hi = _arm_limits(lm, y, c, scale)
+            return row_width_px(f.mask, y, band=1, cx=c, lo=lo, hi=hi)
+        def band(a, b, n=9):
+            vals = [w_at(sy + sh * (a + (b - a) * i / (n - 1)), 0) for i in range(n)]
+            return [v for v in vals if v]
+        # 2026-11-20: bands instead of single rows. Natural waist = NARROWEST row (arms / folds only
+        # ever add width); chest = median near the chest line; hip = low percentile around the hip line.
+        ch, wa, hp = band(0.12, 0.26), band(0.45, 0.80, 13), band(0.92, 1.08)
+        if not (ch and wa and hp):
+            return None
+        out["chest"] = float(np.median(ch)) * scale
+        out["waist"] = float(min(wa)) * scale
+        out["hip"] = float(np.percentile(hp, 30)) * scale
+        # auto height (2026-11-20): head top = first mask row above the nose column, floor = ankle + 3.9 %
+        nx = int(min(f.w - 1, max(0, lm[NOSE][0])))
+        col = f.mask[:, max(0, nx - 3):nx + 4].max(axis=1) > 0.5
+        rows = np.where(col)[0]
+        ankle_y = (lm[LEFT_ANKLE][1] + lm[RIGHT_ANKLE][1]) / 2.0
+        if rows.size:
+            top = float(rows[0])
+            out["px_h"] = (ankle_y - top) / (1 - ANKLE_HEIGHT_FRAC)
+            out["feet_y"] = ankle_y / f.h
+        return out
 
-        # body centre line between the shoulder and hip mid-points
-        sh_x = (lm[LEFT_SHOULDER][0] + lm[RIGHT_SHOULDER][0]) / 2.0
-        hp_x = (lm[LEFT_HIP][0] + lm[RIGHT_HIP][0]) / 2.0
-        cx = {"chest": sh_x + CHEST_FRAC * (hp_x - sh_x), "waist": sh_x + WAIST_FRAC * (hp_x - sh_x), "hip": hp_x}
+    def _profile_depths(self, p, height_cm):
+        if p.mask is None:
+            return None
+        plm = p.landmarks
+        scale = self._scale(plm, height_cm)
+        ys, xs = self._lines(plm)
+        out = {}
+        sy = ys["chest"] - CHEST_FRAC * (ys["hip"] - ys["chest"]) / (1 - CHEST_FRAC)
+        sh = ys["hip"] - sy
+        def band(a, b, n=9):
+            vals = []
+            for i in range(n):
+                fr = a + (b - a) * i / (n - 1); y = sy + sh * fr
+                c = xs["chest"] + (xs["hip"] - xs["chest"]) * max(0.0, (y - ys["chest"]) / max(1.0, ys["hip"] - ys["chest"]))
+                v = row_width_px(p.mask, y, band=1, cx=c)
+                if v: vals.append(v)
+            return vals
+        ch, wa, hp = band(0.12, 0.26), band(0.45, 0.80, 13), band(0.92, 1.08)
+        if not (ch and wa and hp):
+            return None
+        out["chest"] = float(np.median(ch)) * scale
+        out["waist"] = float(min(wa)) * scale          # hands in front of the belly only add depth
+        out["hip"] = float(np.percentile(hp, 30)) * scale
+        return out
 
-        used_mask = False
-        if f.mask is not None:
-            def _w(y, c):
-                lo, hi = _arm_limits(lm, y, c, scale)
-                return row_width_px(f.mask, y, cx=c, lo=lo, hi=hi)
-            chest_w_px = _w(chest_y, cx["chest"])
-            waist_w_px = _w(waist_y, cx["waist"])
-            hip_w_px = _w(hip_y, cx["hip"])
-            if chest_w_px and waist_w_px and hip_w_px:
-                used_mask = True
-        if not used_mask:
-            # landmark-only fallback: interpolate between shoulder & hip width
-            chest_w_px = shoulder_w_px - CHEST_FRAC * (shoulder_w_px - hip_w_px_lm)
-            waist_w_px = shoulder_w_px - WAIST_FRAC * (shoulder_w_px - hip_w_px_lm)
-            hip_w_px = hip_w_px_lm
+    @staticmethod
+    def _median_dict(rows):
+        rows = [r for r in rows if r]
+        if not rows:
+            return None
+        return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
 
-        chest_w_cm = chest_w_px * scale
-        waist_w_cm = waist_w_px * scale
-        hip_w_cm = hip_w_px * scale
-        shoulder_w_cm = shoulder_w_px * scale
+    def predict_height(self):
+        """cm from the front frames, needs sizing.auto_height.cm_per_px (fixed camera, shopper on the
+        floor marker). Corrected by how far the feet are from the calibration spot (feet_y)."""
+        ah = getattr(self, "auto_height", None) or {}
+        k = ah.get("cm_per_px")
+        if not k or not self.front_frames:
+            return None
+        rows = [self._front_widths(f, 170.0) for f in self.front_frames]
+        rows = [r for r in rows if r and r.get("px_h")]
+        if not rows:
+            return None
+        px = float(np.median([r["px_h"] for r in rows]))
+        fy = float(np.median([r["feet_y"] for r in rows]))
+        # nearer the camera = feet lower in frame = person bigger in px -> shrink, and the reverse
+        corr = 1.0 - float(ah.get("feet_k", 0.0)) * (fy - float(ah.get("feet_y", fy)))
+        return round(px * k * corr, 1), px, fy
 
-        # Profile depths (optional — improves the estimate but not required)
-        chest_d_cm = waist_d_cm = hip_d_cm = None
-        used_profile = False
-        if self.profile is not None and self.profile.mask is not None:
-            p = self.profile
-            plm = p.landmarks
-            p_eye_y = (plm[LEFT_EYE][1] + plm[RIGHT_EYE][1]) / 2.0
-            p_ankle_y = (plm[LEFT_ANKLE][1] + plm[RIGHT_ANKLE][1]) / 2.0
-            p_scale = height_cm / max(1.0, (p_ankle_y - p_eye_y) / (1 - EYE_TO_TOP_FRACTION))
-            p_shoulder_y = (plm[LEFT_SHOULDER][1] + plm[RIGHT_SHOULDER][1]) / 2.0
-            p_hip_y = (plm[LEFT_HIP][1] + plm[RIGHT_HIP][1]) / 2.0
-            p_chest_y = p_shoulder_y + CHEST_FRAC * (p_hip_y - p_shoulder_y)
-            p_waist_y = p_shoulder_y + WAIST_FRAC * (p_hip_y - p_shoulder_y)
-            p_sh_x = (plm[LEFT_SHOULDER][0] + plm[RIGHT_SHOULDER][0]) / 2.0
-            p_hp_x = (plm[LEFT_HIP][0] + plm[RIGHT_HIP][0]) / 2.0
-            cd = row_width_px(p.mask, p_chest_y, cx=p_sh_x + CHEST_FRAC * (p_hp_x - p_sh_x))
-            wd = row_width_px(p.mask, p_waist_y, cx=p_sh_x + WAIST_FRAC * (p_hp_x - p_sh_x))
-            hd = row_width_px(p.mask, p_hip_y, cx=p_hp_x)
-            if cd and wd and hd:
-                chest_d_cm, waist_d_cm, hip_d_cm = cd * p_scale, wd * p_scale, hd * p_scale
-                used_profile = True
+    def compute(self, height_cm: float) -> dict:
+        """Combine the stored front (+ profile) captures into measurements.
+        Median over every stored frame of each view. Returns {} without a front view."""
+        fronts = self.front_frames or ([self.front] if self.front else [])
+        if not fronts:
+            return {}
+        profs = self.profile_frames or ([self.profile] if self.profile else [])
+        calib = getattr(self, "calib", None) or {}
 
-        if used_profile:
-            chest_circ = ellipse_circumference_cm(chest_w_cm, chest_d_cm)
-            waist_circ = ellipse_circumference_cm(waist_w_cm, waist_d_cm)
-            hip_circ = ellipse_circumference_cm(hip_w_cm, hip_d_cm)
-        else:
-            # No profile depth: assume a body-depth/width ratio of ~0.62
-            # (rough average) so we still return a circumference, at lower
-            # confidence, rather than nothing.
-            chest_circ = ellipse_circumference_cm(chest_w_cm, chest_w_cm * 0.62)
-            waist_circ = ellipse_circumference_cm(waist_w_cm, waist_w_cm * 0.62)
-            hip_circ = ellipse_circumference_cm(hip_w_cm, hip_w_cm * 0.62)
+        W = self._median_dict([self._front_widths(f, height_cm) for f in fronts])
+        used_mask = W is not None
+        if not used_mask:      # landmark-only fallback
+            lm = fronts[-1].landmarks
+            scale = self._scale(lm, height_cm)
+            sw = abs(lm[LEFT_SHOULDER][0] - lm[RIGHT_SHOULDER][0]) * scale
+            hw = abs(lm[LEFT_HIP][0] - lm[RIGHT_HIP][0]) * scale * 1.35
+            W = {"shoulder": sw, "chest": sw * 0.86, "waist": sw * 0.74, "hip": hw}
+        D = self._median_dict([self._profile_depths(p, height_cm) for p in profs]) if profs else None
+        used_profile = D is not None
 
-        quality = "high" if (used_mask and used_profile) else \
+        flags = []
+        circ, depth = {}, {}
+        for k in ("chest", "waist", "hip"):
+            lo, hi = DEPTH_RATIO[k]
+            if used_profile:
+                r = D[k] / max(1e-3, W[k])
+                if r < lo or r > hi:
+                    flags.append(f"{k}_depth_clamped({r:.2f})")
+                r = min(hi, max(lo, r))
+            else:
+                r = DEFAULT_DEPTH_RATIO[k]
+            depth[k] = W[k] * r
+            c = ellipse_circumference_cm(W[k], depth[k]) * SHAPE_FACTOR[k]
+            c *= float(calib.get(k, 1.0))
+            blo, bhi = STATURE_BOUNDS[k]
+            if c < blo * height_cm or c > bhi * height_cm:
+                flags.append(f"{k}_out_of_range({c:.0f})")
+                c = min(bhi * height_cm, max(blo * height_cm, c))
+            circ[k] = c
+
+        quality = "high" if (used_mask and used_profile and len(fronts) >= 4) else \
                   "medium" if (used_mask or used_profile) else "low"
+        if any("out_of_range" in f for f in flags):
+            quality = "low"
+        elif flags and quality == "high":
+            quality = "medium"
 
         return {
             "height_cm": height_cm,
-            "shoulder_cm": round(shoulder_w_cm, 1),
-            "chest_cm": round(chest_circ, 1),
-            "waist_cm": round(waist_circ, 1),
-            "hip_cm": round(hip_circ, 1),
+            "shoulder_cm": round(W["shoulder"], 1),
+            "chest_cm": round(circ["chest"], 1),
+            "waist_cm": round(circ["waist"], 1),
+            "hip_cm": round(circ["hip"], 1),
             "quality": quality,
+            "raw": {"width": {k: round(v, 1) for k, v in W.items()},
+                    "depth": {k: round(v, 1) for k, v in depth.items()},
+                    "frames": [len(fronts), len(profs)], "flags": flags},
         }
 
 
 # ── Self-test: pure math, no camera / no mediapipe required ─────────────────
 def _selftest():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     print("── size_estimator selftest (synthetic data, no camera) ──")
 
     # 1) ellipse circumference sanity: a circle of radius 15cm -> 2*pi*15
@@ -508,10 +675,18 @@ def _selftest():
     print(f"one-pieces chest=100/hip=118 -> {r3}")
     assert r3["size"] == "XL"  # driven by the larger hip band
 
+    sizes = recommend_size_set({"chest_cm": 100, "waist_cm": 84, "hip_cm": 104, "quality": "high"})
+    assert set(sizes) == {"men", "women"}
+    assert sizes["women"]["trousers_eu"] in list(range(32, 49, 2)) + ["48+"]
+    assert sizes["men"]["trousers_eu"] in list(range(36, 49, 2)) + ["48+"]
+    assert sizes["women"]["tops"] in SIZE_ORDER and sizes["men"]["tops"] in SIZE_ORDER
+    print(f"size crosswalk: {sizes}")
+
     # 4) full compute() pipeline with synthetic landmarks + masks
     #    (simulates a ~178cm person, no real mediapipe needed)
     est = SizeEstimator.__new__(SizeEstimator)  # bypass mediapipe import
     est.available = True
+    est.front_frames, est.profile_frames, est.calib = [], [], {}
     # Proportions matter here: shoulder width should be ~22% of standing
     # height (real biacromial-breadth average), not an arbitrary guess —
     # otherwise the derived circumference comes out anatomically tiny and
@@ -548,7 +723,7 @@ def _make_body_mask() -> np.ndarray:
     return mask
 
 
-# ── Live webcam CLI (manual test) ────────────────────────────────────────────
+# ── Live webcam CLI (manual test on the kiosk machine) ──────────────────────
 def _webcam_cli():
     import cv2
     est = SizeEstimator()

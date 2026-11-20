@@ -13,19 +13,26 @@ Size Scan is the sizing step of [Fashion Mirror](https://alaabelghith.github.io/
 ## How it works
 
 1. **Body points and silhouette.** MediaPipe Pose Landmarker finds 33 body points and a segmentation mask in each camera frame.
-2. **Guidance.** Each frame is checked: whole body in frame, feet visible, facing the camera (front), then turned 90° (side). The scan only counts frames that pass, and needs 12 in a row for each pose.
-3. **Scale.** Your height and the eye-to-ankle distance in the image give centimetres per pixel. The eyes sit about 7 % of standing height below the top of the head.
-4. **Widths and depths.** Three lines are placed between the shoulder and hip points: chest, waist, hips. On the front view the silhouette is measured along each line, **torso only**: arms held away from the body are separated by background and left out, and an arm touching the body is cut at its inner edge, found from the elbow and wrist points. The side view gives the depth at the same three lines.
-5. **Circumference.** Each cross-section is treated as an ellipse, width × depth, and its perimeter is Ramanujan's approximation. Every value is the median over the stable frames.
-6. **Size.** The circumferences are matched against a size chart (tops by chest, bottoms by waist, dresses by the larger of chest and hips). A value within 2 cm of a boundary also returns the neighbouring size, and a confidence level is shown.
+2. **Guidance.** Each frame is checked: whole body in frame, feet visible, facing the camera with **arms clearly away from the body** (front), then turned 90° (side). The scan only counts frames that pass, and needs 12 in a row for each pose.
+3. **Scale.** Your height and the eye-to-ankle distance in the image give centimetres per pixel (eyes at about 93.6 % of standing height, ankles at about 3.9 %; the ankle point is not the floor).
+4. **Widths and depths.** Three bands are measured between the shoulder and hip points, torso only (arms and hands touching the body are cut off at their inner edge, found from the elbow and wrist points plus the hand below the wrist):
+   - chest: median width over the chest band,
+   - waist: the **narrowest** row between chest and hips (arms and clothing folds can only add width),
+   - hips: 30th percentile around the hip line.
+   The side view gives the depths over the same bands.
+5. **Circumference.** Each cross-section is an ellipse (width × depth, Ramanujan's approximation) times a shape factor (chest 1.06, waist 1.02, hips 1.05), then a calibration factor (default: waist 0.88, hips 0.90, from test scans). Side depths outside plausible depth/width ratios are clamped, and values impossible for the given height are clamped with low confidence. Every value is the median over the stable frames.
+6. **Size.** Men's or women's chart: tops by chest (men: Primark ranges, XL = 109–118 cm), bottoms by waist, dresses by the larger of chest and hips, and the **French trouser number** (36–48 men, 32–48 women, number ≈ waist ÷ 2 as at Celio / Kiabi; "48+" above, like mass retail in France and Tunisia).
 
-Without a side view, the depth is assumed to be 0.62 × the width, and confidence drops.
+Without a side view, the depth is assumed from average depth/width ratios, and confidence drops.
 
-## Accuracy
+## Auto height (fixed camera)
 
-This is a demo-grade estimate. It has been checked on test subjects, not validated with a tape measure on a group of people. Expect a few centimetres of error: loose clothing, posture, camera height and lens distortion all move the numbers. Use it as a starting point, keep a size-exchange policy, and test it against your own customers before relying on it.
+One camera cannot know absolute size, so height is typed in by default. For a **fixed** setup (kiosk, shop mirror, a phone on a tripod) the height can be estimated for everyone:
 
-The size chart in `src/estimator.js` is a demo chart (S to XL). Replace `SIZE_CHARTS` with your brand's chart.
+1. Put a mark on the floor where people stand. Do not move the camera after this.
+2. Open the page with `?calibrate=183` (the real height of the person scanning) and do one scan. The page stores centimetres per pixel for this camera.
+3. From then on every scan estimates the height from the silhouette (head top to floor) and shows "Height estimated". Standing off the mark by 20–30 cm moves the estimate by roughly 5–10 cm.
+4. `?auto=0` forgets the calibration.
 
 ## Run it locally
 
@@ -41,7 +48,7 @@ Tests for the measuring maths (Node 18+):
 node tests/estimator.test.mjs
 ```
 
-URL options: `?lang=fr` or `?lang=ar`, `?theme=light`, `?h=172` (height), `?gpu=1` (try the GPU delegate; on many devices it returns an empty mask, so CPU is the default).
+URL options: `?lang=fr` or `?lang=ar`, `?theme=light`, `?h=172` (height), `?g=women`, `?calibrate=183` / `?auto=0` (auto height), `?gpu=1` (try the GPU delegate; on many devices it returns an empty mask, so CPU is the default).
 
 ## Python version
 

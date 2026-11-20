@@ -6,15 +6,14 @@
  * Fashion Mirror kiosk:
  *
  *   1. Scale. The user's height and the eye-to-ankle distance in the image give
- *      centimetres per pixel (eyes sit about 7 % of standing height below the top
- *      of the head).
- *   2. Widths. On the front view, the silhouette from the segmentation mask is
- *      measured at a chest line, a waist line and the hip line, placed between the
- *      shoulder and hip landmarks. Only the body counts: arms held away from it
- *      are separated by background and left out.
+ *      centimetres per pixel (eyes at ~93.6 % of stature, ankles at ~3.9 %). With a
+ *      fixed camera, predictHeight() can also estimate the height itself.
+ *   2. Widths. On the front view, the silhouette is measured over three bands between
+ *      the shoulder and hip landmarks: chest (median), natural waist (narrowest row),
+ *      hips (30th percentile). Arms and hands touching the body are cut off.
  *   3. Depths. The same three lines are measured on the side view.
- *   4. Circumference. Each cross-section is treated as an ellipse (width x depth),
- *      using Ramanujan's approximation for its perimeter.
+ *   4. Circumference. Each cross-section is an ellipse (width x depth, Ramanujan) times
+ *      a shape factor, then a calibration factor; implausible depths / values are clamped.
  *   5. Size. Each circumference is matched against a size chart; a value near a
  *      boundary also returns the neighbouring size.
  *
@@ -32,37 +31,68 @@ export const LM = {
 };
 
 export const VIS_MIN = 0.55;            // landmark visibility needed to trust a point
-export const EYE_TO_TOP_FRACTION = 0.07; // eyes sit ~7 % of standing height below the top of the head
+export const EYE_HEIGHT_FRAC = 0.936;   // eye height / stature (anthropometric average)
+export const ANKLE_HEIGHT_FRAC = 0.039; // ankle (malleolus) height / stature: the ankle point is NOT the floor
 export const CHEST_FRAC = 0.18;         // chest line, as a fraction of the shoulder -> hip span
 export const WAIST_FRAC = 0.62;         // waist line
 export const MIN_MASK_ROW_PIXELS = 8;   // fewer foreground pixels than this = unreliable row
-export const DEPTH_RATIO = 0.62;        // body depth / width when no side view is available
-export const UPPER_ARM_HALF_CM = 4.5;  // half the thickness of an upper arm / forearm, used where an arm
-export const FOREARM_HALF_CM = 3.5;    // touches the body in the front view and has to be cut off
+export const UPPER_ARM_HALF_CM = 4.5;   // half the thickness of an upper arm / forearm, used where an arm
+export const FOREARM_HALF_CM = 3.5;     // touches the body in the front view and has to be cut off
+export const HAND_FRAC = 0.8;           // the hand hangs ~0.8 forearm below the wrist point
 export const MAX_GAP_FRAC = 0.004;      // background gap (fraction of image width) still counted as body
+export const ARM_GAP_CM = 10;           // front pose: wrists at least this far outside the hips
+// Cross-sections are rounder-rectangular than an ellipse: shape factors on top of Ramanujan.
+export const SHAPE_FACTOR = { chest: 1.06, waist: 1.02, hip: 1.05 };
+// Plausible side-depth / front-width ratios; outside = bad side view (arm in front, half turned) -> clamped.
+export const DEPTH_RATIO = { chest: [0.58, 0.85], waist: [0.60, 0.95], hip: [0.62, 0.88] };
+export const DEFAULT_DEPTH_RATIO = { chest: 0.70, waist: 0.75, hip: 0.72 }; // when no side view
+// Plausible circumference / stature for adults; outside -> clamped and confidence low.
+export const STATURE_BOUNDS = { chest: [0.45, 0.78], waist: [0.36, 0.72], hip: [0.47, 0.80] };
+// Correction factors from test scans (waist and hips read high). Replace with your own tape-measure calibration.
+export const DEFAULT_CALIBRATION = { chest: 1.0, waist: 0.88, hip: 0.9 };
+// Measuring bands, as fractions of the shoulder (0) -> hip (1) span.
+const BANDS = { chest: [0.12, 0.26, 9], waist: [0.45, 0.80, 13], hip: [0.92, 1.08, 9] };
 
 /**
- * Demo size chart (cm). Replace with your own brand's chart: sizes run small to
- * large, and every category needs the same size names.
+ * Size charts (cm, body measurements). Tops by chest, bottoms by waist (letter + French
+ * trouser number), dresses by the larger of chest and hips. Men's tops follow Primark's chart;
+ * trouser numbers are the French system (number ~ waist / 2, Celio / Kiabi), capped at 48 like
+ * mass retail in France and Tunisia ("48+" above). Replace with your brand's charts.
  */
+export const SIZE_ORDER = ['S', 'M', 'L', 'XL', 'XXL'];
 export const SIZE_CHARTS = {
-  tops: { // chest circumference
-    S: [82, 90], M: [90, 98], L: [98, 106], XL: [106, 116],
+  women: {
+    tops: { S: [82, 90], M: [90, 98], L: [98, 106], XL: [106, 116], XXL: [116, 128] },
+    bottoms: {
+      S: { waist: [66, 74], hip: [88, 96] }, M: { waist: [74, 82], hip: [96, 104] },
+      L: { waist: [82, 90], hip: [104, 112] }, XL: { waist: [90, 100], hip: [112, 122] },
+      XXL: { waist: [100, 114], hip: [122, 138] },
+    },
+    'one-pieces': {
+      S: { chest: [82, 90], hip: [88, 96] }, M: { chest: [90, 98], hip: [96, 104] },
+      L: { chest: [98, 106], hip: [104, 112] }, XL: { chest: [106, 116], hip: [112, 122] },
+      XXL: { chest: [116, 128], hip: [122, 138] },
+    },
   },
-  bottoms: { // waist decides, hip shown
-    S: { waist: [66, 74], hip: [88, 96] },
-    M: { waist: [74, 82], hip: [96, 104] },
-    L: { waist: [82, 90], hip: [104, 112] },
-    XL: { waist: [90, 100], hip: [112, 122] },
-  },
-  'one-pieces': { // the larger of the chest and hip sizes
-    S: { chest: [82, 90], hip: [88, 96] },
-    M: { chest: [90, 98], hip: [96, 104] },
-    L: { chest: [98, 106], hip: [104, 112] },
-    XL: { chest: [106, 116], hip: [112, 122] },
+  men: {
+    tops: { S: [90, 97], M: [97, 103], L: [103, 109], XL: [109, 119], XXL: [119, 128] },
+    bottoms: {
+      S: { waist: [74, 82], hip: [90, 98] }, M: { waist: [82, 90], hip: [98, 106] },
+      L: { waist: [90, 98], hip: [106, 114] }, XL: { waist: [98, 108], hip: [114, 124] },
+      XXL: { waist: [108, 120], hip: [124, 138] },
+    },
+    'one-pieces': {
+      S: { chest: [90, 97], hip: [90, 98] }, M: { chest: [97, 103], hip: [98, 106] },
+      L: { chest: [103, 109], hip: [106, 114] }, XL: { chest: [109, 119], hip: [114, 124] },
+      XXL: { chest: [119, 128], hip: [124, 138] },
+    },
   },
 };
-export const SIZE_ORDER = ['S', 'M', 'L', 'XL'];
+export const TROUSER_FR = {
+  women: { 32: [60, 64], 34: [64, 68], 36: [68, 72], 38: [72, 76], 40: [76, 80], 42: [80, 84], 44: [84, 88], 46: [88, 92], 48: [92, 98] },
+  men: { 36: [70, 74], 38: [74, 78], 40: [78, 82], 42: [82, 86], 44: [86, 90], 46: [90, 94], 48: [94, 98], 50: [98, 102], 52: [102, 106], 54: [106, 112] },
+};
+export const RETAIL_MAX = 48;
 
 // ── geometry ────────────────────────────────────────────────────────────────
 
@@ -76,13 +106,9 @@ export function ellipseCircumference(width, depth) {
 
 /**
  * Width in pixels of the body on one image row, median over a small band of rows.
- *
- * With `cx` (the body's centre line, in mask pixels) only the run of foreground
- * pixels that contains the centre counts, so arms held slightly away from the
- * body are left out. Gaps of up to `MAX_GAP_FRAC` of the image width are bridged
- * (mask noise). Without `cx` it falls back to first-to-last foreground pixel.
- * `lo` / `hi` cap the run where an arm touches the body (see armLimits).
- * Returns null if the row is empty.
+ * With `cx` (the body's centre line, in mask pixels) only the run of foreground pixels that
+ * contains the centre counts, so arms held away from the body are left out. Gaps of up to
+ * MAX_GAP_FRAC of the width are bridged. `lo` / `hi` cap the run where an arm touches the body.
  * @param {{data: Float32Array|Uint8Array|number[], width: number, height: number}} mask  values 0..1
  */
 export function rowWidthPx(mask, yRow, band = 2, cx = null, lo = -Infinity, hi = Infinity) {
@@ -104,7 +130,7 @@ export function rowRunPx(mask, yRow, band = 2, cx = null, lo = -Infinity, hi = I
     if (count < MIN_MASK_ROW_PIXELS) continue;
     if (cx == null) { widths.push(last - first); ls.push(first); rs.push(last); continue; }
     let c = Math.round(Math.min(w - 1, Math.max(0, cx)));
-    if (!on(c)) { // centre fell on background: take the nearest foreground pixel within a gap
+    if (!on(c)) {
       let d = 1; while (d <= maxGap && !(c - d >= 0 && on(c - d)) && !(c + d < w && on(c + d))) d++;
       if (d > maxGap) continue;
       c = c - d >= 0 && on(c - d) ? c - d : c + d;
@@ -112,7 +138,7 @@ export function rowRunPx(mask, yRow, band = 2, cx = null, lo = -Infinity, hi = I
     let l = c, r = c;
     for (let x = c - 1, gap = 0; x >= 0; x--) { if (on(x)) { l = x; gap = 0; } else if (++gap > maxGap) break; }
     for (let x = c + 1, gap = 0; x < w; x++) { if (on(x)) { r = x; gap = 0; } else if (++gap > maxGap) break; }
-    l = Math.max(l, lo); r = Math.min(r, hi);   // arms merged with the body: cut at the arm's inner edge
+    l = Math.max(l, lo); r = Math.min(r, hi);
     if (r - l + 1 >= MIN_MASK_ROW_PIXELS) { widths.push(r - l); ls.push(l); rs.push(r); }
   }
   return widths.length ? { width: median(widths), l: median(ls), r: median(rs) } : null;
@@ -125,13 +151,20 @@ export function median(values) {
   return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
 }
 
+/** Linear-interpolated percentile (same as numpy.percentile). */
+export function percentile(values, p) {
+  const v = values.filter((x) => x != null && Number.isFinite(x)).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const i = (v.length - 1) * p / 100, lo = Math.floor(i), hi = Math.ceil(i);
+  return v[lo] + (v[hi] - v[lo]) * (i - lo);
+}
+
 // ── pose checks (live guidance) ─────────────────────────────────────────────
 
 /**
  * Is this frame good enough to measure?
  * @param {Array<{x:number,y:number,visibility?:number}>|null} landmarks  normalised 0..1
  * @param {'front'|'side'} view
- * @param {number} w @param {number} h  image size in pixels
  * @returns {{ok: boolean, msg: string}}  msg is a key for the UI text
  */
 export function checkPose(landmarks, view, w, h) {
@@ -148,9 +181,15 @@ export function checkPose(landmarks, view, w, h) {
   if (view === 'front') {
     if (!torsoOk) return { ok: false, msg: 'arms' };
     if (shoulderW < w * 0.10) return { ok: false, msg: 'face' };
+    // arms must not touch the torso: hands at the waist were the biggest error source
+    const cmPx = 160 / Math.max(1, span);
+    const hl = Math.min(lh.x, rh.x), hr = Math.max(lh.x, rh.x), half = (hr - hl) * 0.75, cxh = (hl + hr) / 2;
+    for (const wr of [p(LM.LEFT_WRIST), p(LM.RIGHT_WRIST)]) {
+      if (wr.v < 0.3 || Math.abs(wr.x - cxh) - half < ARM_GAP_CM / cmPx) return { ok: false, msg: 'arms' };
+    }
     return { ok: true, msg: 'hold' };
   }
-  if (shoulderW > w * 0.09) return { ok: false, msg: 'turn' };
+  if (shoulderW > w * 0.12) return { ok: false, msg: 'turn' };
   if (!(ls.v > VIS_MIN || rs.v > VIS_MIN)) return { ok: false, msg: 'turn' };
   return { ok: true, msg: 'hold' };
 }
@@ -162,119 +201,158 @@ function vis(l) {
 
 // ── measuring one frame ─────────────────────────────────────────────────────
 
-function lines(landmarks, w, h, heightCm) {
+function geom(landmarks, w, h, heightCm) {
   const y = (i) => landmarks[i].y * h, x = (i) => landmarks[i].x * w;
   const eyeY = (y(LM.LEFT_EYE) + y(LM.RIGHT_EYE)) / 2;
   const ankleY = (y(LM.LEFT_ANKLE) + y(LM.RIGHT_ANKLE)) / 2;
-  const totalPx = Math.max(1, ankleY - eyeY) / (1 - EYE_TO_TOP_FRACTION);
-  const shoulderY = (y(LM.LEFT_SHOULDER) + y(LM.RIGHT_SHOULDER)) / 2;
-  const hipY = (y(LM.LEFT_HIP) + y(LM.RIGHT_HIP)) / 2;
-  const shoulderX = (x(LM.LEFT_SHOULDER) + x(LM.RIGHT_SHOULDER)) / 2;
-  const hipX = (x(LM.LEFT_HIP) + x(LM.RIGHT_HIP)) / 2;
-  const cxAt = (f) => shoulderX + f * (hipX - shoulderX); // body centre line, f = 0 shoulders .. 1 hips
-  const scale = heightCm / totalPx;
-  // Inner edge of each arm at a given row: the arm's centre line (shoulder -> elbow -> wrist)
-  // moved inwards by half an arm's thickness. Null where the arm is not at that height.
-  const armEdge = (ids, yy) => {
-    const pts = ids.map((i) => landmarks[i]);
-    if (pts.some((p) => vis(p) < 0.3)) return null;
-    for (let k = 0; k < 2; k++) {
-      const a = pts[k], b = pts[k + 1], ay = a.y * h, by = b.y * h;
-      if (yy >= Math.min(ay, by) && yy <= Math.max(ay, by) && by !== ay) {
-        const ax = a.x * w + ((yy - ay) / (by - ay)) * (b.x - a.x) * w;
-        const half = (k === 0 ? UPPER_ARM_HALF_CM : FOREARM_HALF_CM) / scale;
-        const centre = cxAt(Math.min(1, Math.max(0, (yy - shoulderY) / Math.max(1, hipY - shoulderY))));
-        return ax < centre ? ax + half : ax - half;
+  const scale = heightCm * (EYE_HEIGHT_FRAC - ANKLE_HEIGHT_FRAC) / Math.max(1, ankleY - eyeY); // cm per px
+  const sy = (y(LM.LEFT_SHOULDER) + y(LM.RIGHT_SHOULDER)) / 2, hy = (y(LM.LEFT_HIP) + y(LM.RIGHT_HIP)) / 2;
+  const sx = (x(LM.LEFT_SHOULDER) + x(LM.RIGHT_SHOULDER)) / 2, hx = (x(LM.LEFT_HIP) + x(LM.RIGHT_HIP)) / 2;
+  const chestY = sy + CHEST_FRAC * (hy - sy), chestX = sx + CHEST_FRAC * (hx - sx);
+  // centre line: chest point -> hip point, extended below the hips
+  const cxAt = (yy) => chestX + (hx - chestX) * Math.max(0, (yy - chestY) / Math.max(1, hy - chestY));
+  // inner edge of each arm at a row: shoulder -> elbow -> wrist (+ hand) moved in by half an arm
+  const armLimits = (yy) => {
+    const c = cxAt(yy);
+    let lo = -Infinity, hi = Infinity;
+    for (const ids of [[LM.LEFT_SHOULDER, LM.LEFT_ELBOW, LM.LEFT_WRIST], [LM.RIGHT_SHOULDER, LM.RIGHT_ELBOW, LM.RIGHT_WRIST]]) {
+      const pts = ids.map((i) => ({ x: landmarks[i].x * w, y: landmarks[i].y * h, v: vis(landmarks[i]) }));
+      if (pts.some((p) => p.v < 0.3)) continue;
+      const [, e, wr] = pts;
+      pts[2] = { x: wr.x + HAND_FRAC * (wr.x - e.x), y: wr.y + HAND_FRAC * (wr.y - e.y), v: wr.v };
+      for (let k = 0; k < 2; k++) {
+        const a = pts[k], b = pts[k + 1];
+        if (yy >= Math.min(a.y, b.y) && yy <= Math.max(a.y, b.y) && b.y !== a.y) {
+          const ax = a.x + ((yy - a.y) / (b.y - a.y)) * (b.x - a.x);
+          const half = (k === 0 ? UPPER_ARM_HALF_CM : FOREARM_HALF_CM) / scale;
+          if (ax < c) lo = Math.max(lo, ax + half); else hi = Math.min(hi, ax - half);
+          break;
+        }
       }
     }
-    return null;
-  };
-  const limits = (yy) => {
-    const e = [armEdge([LM.LEFT_SHOULDER, LM.LEFT_ELBOW, LM.LEFT_WRIST], yy), armEdge([LM.RIGHT_SHOULDER, LM.RIGHT_ELBOW, LM.RIGHT_WRIST], yy)];
-    const c = cxAt(Math.min(1, Math.max(0, (yy - shoulderY) / Math.max(1, hipY - shoulderY))));
-    let lo = -Infinity, hi = Infinity;
-    for (const v of e) { if (v == null) continue; if (v < c) lo = Math.max(lo, v); else hi = Math.min(hi, v); }
     return { lo, hi };
   };
-  const chestY = shoulderY + CHEST_FRAC * (hipY - shoulderY), waistY = shoulderY + WAIST_FRAC * (hipY - shoulderY);
   return {
-    scale, // cm per pixel
-    shoulderY, hipY,
-    limits: { chest: limits(chestY), waist: limits(waistY), hip: limits(hipY) },
-    cx: { chest: cxAt(CHEST_FRAC), waist: cxAt(WAIST_FRAC), hip: cxAt(1) },
-    chestY: shoulderY + CHEST_FRAC * (hipY - shoulderY),
-    waistY: shoulderY + WAIST_FRAC * (hipY - shoulderY),
+    scale, sy, hy, ankleY, cxAt, armLimits,
+    lineY: { chest: chestY, waist: sy + WAIST_FRAC * (hy - sy), hip: hy },
     shoulderWpx: Math.abs(x(LM.LEFT_SHOULDER) - x(LM.RIGHT_SHOULDER)),
     hipWpxLm: Math.abs(x(LM.LEFT_HIP) - x(LM.RIGHT_HIP)),
   };
 }
 
-/** Front view -> widths in cm. Falls back to landmarks if the mask is missing. */
-export function frontWidths(landmarks, mask, w, h, heightCm) {
-  const L = lines(landmarks, w, h, heightCm);
-  let chest = null, waist = null, hip = null, usedMask = false, segs = null;
-  if (mask) {
-    const sx = mask.width / w, sy = mask.height / h; // mask may be smaller than the frame
-    const at = (y, cx, lim) => rowRunPx(mask, y * sy, 2, cx * sx, lim.lo * sx, lim.hi * sx);
-    const c = at(L.chestY, L.cx.chest, L.limits.chest), wa = at(L.waistY, L.cx.waist, L.limits.waist), hi = at(L.hipY, L.cx.hip, L.limits.hip);
-    if (c && wa && hi) {
-      chest = c.width / sx; waist = wa.width / sx; hip = hi.width / sx; usedMask = true;
-      segs = [[L.chestY, c], [L.waistY, wa], [L.hipY, hi]].map(([y, q]) => ({ y: y / h, x0: q.l / mask.width, x1: q.r / mask.width }));
+/** Measure the three bands on a mask; `arms` = cut arms touching the body (front view). */
+function measureBands(G, mask, w, h, arms) {
+  const sx = mask.width / w, sy = mask.height / h;   // mask may be smaller than the frame
+  const out = {}, segs = [];
+  for (const [k, [a, b, n]] of Object.entries(BANDS)) {
+    const vals = [];
+    for (let i = 0; i < n; i++) {
+      const yy = G.sy + (G.hy - G.sy) * (a + (b - a) * i / (n - 1));
+      const c = G.cxAt(yy), lim = arms ? G.armLimits(yy) : { lo: -Infinity, hi: Infinity };
+      const run = rowRunPx(mask, yy * sy, 1, c * sx, lim.lo * sx, lim.hi * sx);
+      if (run) vals.push({ yy, run });
     }
+    if (!vals.length) return null;
+    const ws = vals.map((v) => v.run.width / sx);
+    // chest = median; natural waist = narrowest row (arms / folds only add width); hips = 30th percentile
+    out[k] = (k === 'chest' ? median(ws) : k === 'waist' ? Math.min(...ws) : percentile(ws, 30)) * G.scale;
+    const pick = k === 'waist' ? vals[ws.indexOf(Math.min(...ws))] : vals[vals.length >> 1];
+    segs.push({ y: pick.yy / h, x0: pick.run.l / mask.width, x1: pick.run.r / mask.width });
   }
-  if (!usedMask) {
-    chest = L.shoulderWpx - CHEST_FRAC * (L.shoulderWpx - L.hipWpxLm);
-    waist = L.shoulderWpx - WAIST_FRAC * (L.shoulderWpx - L.hipWpxLm);
-    hip = L.hipWpxLm;
+  out.segs = segs;
+  return out;
+}
+
+/** Front view -> widths in cm (+ person height in px for auto height). Falls back to landmarks without a mask. */
+export function frontWidths(landmarks, mask, w, h, heightCm) {
+  const G = geom(landmarks, w, h, heightCm);
+  const res = { usedMask: false, shoulder: G.shoulderWpx * G.scale, segs: null, pxH: null, feetY: null };
+  const B = mask ? measureBands(G, mask, w, h, true) : null;
+  if (B) {
+    Object.assign(res, { usedMask: true, chest: B.chest, waist: B.waist, hip: B.hip, segs: B.segs });
+    // head top = first mask row in the nose column; floor = ankle + ankle height
+    const msx = mask.width / w, msy = mask.height / h;
+    const nx = Math.round(Math.min(w - 1, Math.max(0, landmarks[LM.NOSE].x * w)) * msx);
+    for (let yy = 0; yy < mask.height; yy++) {
+      let hit = false;
+      for (let dx = -3; dx <= 3 && !hit; dx++) { const xx = nx + dx; if (xx >= 0 && xx < mask.width && mask.data[yy * mask.width + xx] > 0.5) hit = true; }
+      if (hit) { res.pxH = (G.ankleY - yy / msy) / (1 - ANKLE_HEIGHT_FRAC); res.feetY = G.ankleY / h; break; }
+    }
+  } else {
+    const s = G.shoulderWpx * G.scale;
+    Object.assign(res, { chest: s * 0.86, waist: s * 0.74, hip: G.hipWpxLm * G.scale * 1.35 });
   }
-  return {
-    usedMask,
-    shoulder: L.shoulderWpx * L.scale,
-    chest: chest * L.scale, waist: waist * L.scale, hip: hip * L.scale,
-    segs, // where each width was measured, normalised 0..1 (for drawing)
-  };
+  return res;
 }
 
 /** Side view -> depths in cm, or null without a usable mask. */
 export function sideDepths(landmarks, mask, w, h, heightCm) {
   if (!mask) return null;
-  const L = lines(landmarks, w, h, heightCm);
-  const sx = mask.width / w, sy = mask.height / h;
-  const c = rowRunPx(mask, L.chestY * sy, 2, L.cx.chest * sx);
-  const wa = rowRunPx(mask, L.waistY * sy, 2, L.cx.waist * sx);
-  const hi = rowRunPx(mask, L.hipY * sy, 2, L.cx.hip * sx);
-  if (!(c && wa && hi)) return null;
-  return {
-    chest: (c.width / sx) * L.scale, waist: (wa.width / sx) * L.scale, hip: (hi.width / sx) * L.scale,
-    segs: [[L.chestY, c], [L.waistY, wa], [L.hipY, hi]].map(([y, q]) => ({ y: y / h, x0: q.l / mask.width, x1: q.r / mask.width })),
-  };
+  const B = measureBands(geom(landmarks, w, h, heightCm), mask, w, h, false);
+  return B ? { chest: B.chest, waist: B.waist, hip: B.hip, segs: B.segs } : null;
+}
+
+/**
+ * Auto height for a FIXED camera: the person stands on a floor marker, and one calibration
+ * scan of someone with a known height gives cm per pixel. Feet lower in the frame = closer.
+ * @param {Array} fronts  frontWidths() results (any height used)
+ * @param {{cmPerPx:number, feetY?:number, feetK?:number}} cal
+ */
+export function predictHeight(fronts, cal) {
+  if (!cal || !cal.cmPerPx) return null;
+  const px = median(fronts.map((f) => f.pxH)), fy = median(fronts.map((f) => f.feetY));
+  if (!px) return null;
+  const corr = 1 - (cal.feetK || 0) * (fy - (cal.feetY ?? fy));
+  const cm = Math.round(px * cal.cmPerPx * corr);
+  return cm >= 140 && cm <= 210 ? cm : null;
+}
+
+/** Calibration for predictHeight from the fronts of one scan of a person of known height. */
+export function heightCalibration(fronts, knownCm) {
+  const px = median(fronts.map((f) => f.pxH)), fy = median(fronts.map((f) => f.feetY));
+  return px ? { cmPerPx: knownCm / px, feetY: fy, feetK: 0 } : null;
 }
 
 /**
  * Combine the per-frame results (median of each value) into circumferences.
- * @param {Array} fronts  frontWidths() results
+ * @param {Array} fronts  frontWidths() results (measured with heightCm)
  * @param {Array} sides   sideDepths() results (may be empty)
+ * @param {object} calib  multiplicative corrections {chest, waist, hip}
  */
-export function combine(fronts, sides, heightCm) {
+export function combine(fronts, sides, heightCm, calib = DEFAULT_CALIBRATION) {
   if (!fronts.length) return null;
   const med = (arr, k) => median(arr.map((f) => f[k]));
-  const fw = { chest: med(fronts, 'chest'), waist: med(fronts, 'waist'), hip: med(fronts, 'hip'), shoulder: med(fronts, 'shoulder') };
+  const W = { chest: med(fronts, 'chest'), waist: med(fronts, 'waist'), hip: med(fronts, 'hip'), shoulder: med(fronts, 'shoulder') };
   const usedMask = fronts.filter((f) => f.usedMask).length * 2 >= fronts.length;
   const goodSides = sides.filter(Boolean);
   const usedSide = goodSides.length > 0;
-  const sd = usedSide
-    ? { chest: med(goodSides, 'chest'), waist: med(goodSides, 'waist'), hip: med(goodSides, 'hip') }
-    : { chest: fw.chest * DEPTH_RATIO, waist: fw.waist * DEPTH_RATIO, hip: fw.hip * DEPTH_RATIO };
-  const quality = usedMask && usedSide ? 'high' : usedMask || usedSide ? 'medium' : 'low';
+  const D = usedSide ? { chest: med(goodSides, 'chest'), waist: med(goodSides, 'waist'), hip: med(goodSides, 'hip') } : null;
+  const flags = [], circ = {}, depth = {};
+  for (const k of ['chest', 'waist', 'hip']) {
+    const [lo, hi] = DEPTH_RATIO[k];
+    let r = DEFAULT_DEPTH_RATIO[k];
+    if (usedSide) {
+      r = D[k] / Math.max(1e-3, W[k]);
+      if (r < lo || r > hi) flags.push(`${k}_depth_clamped(${r.toFixed(2)})`);
+      r = Math.min(hi, Math.max(lo, r));
+    }
+    depth[k] = W[k] * r;
+    let c = ellipseCircumference(W[k], depth[k]) * SHAPE_FACTOR[k] * ((calib && calib[k]) || 1);
+    const [blo, bhi] = STATURE_BOUNDS[k];
+    if (c < blo * heightCm || c > bhi * heightCm) { flags.push(`${k}_out_of_range(${Math.round(c)})`); c = Math.min(bhi * heightCm, Math.max(blo * heightCm, c)); }
+    circ[k] = c;
+  }
+  let quality = usedMask && usedSide && fronts.length >= 4 ? 'high' : usedMask || usedSide ? 'medium' : 'low';
+  if (flags.some((f) => f.includes('out_of_range'))) quality = 'low';
+  else if (flags.length && quality === 'high') quality = 'medium';
   const r1 = (v) => Math.round(v * 10) / 10;
   return {
     height_cm: heightCm,
-    shoulder_cm: r1(fw.shoulder),
-    chest_cm: r1(ellipseCircumference(fw.chest, sd.chest)),
-    waist_cm: r1(ellipseCircumference(fw.waist, sd.waist)),
-    hip_cm: r1(ellipseCircumference(fw.hip, sd.hip)),
+    shoulder_cm: r1(W.shoulder),
+    chest_cm: r1(circ.chest), waist_cm: r1(circ.waist), hip_cm: r1(circ.hip),
     quality,
     frames: { front: fronts.length, side: goodSides.length },
+    raw: { width: Object.fromEntries(Object.entries(W).map(([k, v]) => [k, r1(v)])), depth: Object.fromEntries(Object.entries(depth).map(([k, v]) => [k, r1(v)])), flags },
   };
 }
 
@@ -306,9 +384,11 @@ function pickFromRanges(value, ranges) {
 /**
  * @param {{chest_cm?:number, waist_cm?:number, hip_cm?:number, quality?:string}} m
  * @param {'tops'|'bottoms'|'one-pieces'} category
+ * @param {'men'|'women'|object} gender  a key of SIZE_CHARTS, or a chart object of your own
  * @returns {{size:string|null, alternative:string|null, confidence:string, basis:string|null}}
  */
-export function recommendSize(m, category, charts = SIZE_CHARTS) {
+export function recommendSize(m, category, gender = 'women') {
+  const charts = typeof gender === 'string' ? (SIZE_CHARTS[gender] || SIZE_CHARTS.women) : gender;
   const chart = charts[category] || charts.tops;
   const quality = m.quality || 'medium';
   let size, neighbor, edge, basis;
@@ -332,6 +412,24 @@ export function recommendSize(m, category, charts = SIZE_CHARTS) {
   }
   const confidence = quality === 'high' && edge > 2.5 ? 'high' : quality === 'low' || edge < 1.0 ? 'low' : 'medium';
   return { size, alternative: neighbor, confidence, basis };
+}
+
+/** French trouser number from the waist (36..48 men, 32..48 women; above 48 -> "48+"). */
+export function trouserFR(waistCm, gender = 'men') {
+  if (waistCm == null) return null;
+  const ranges = TROUSER_FR[gender] || TROUSER_FR.men;
+  let best = null, bestScore = Infinity;
+  for (const [n, [lo, hi]] of Object.entries(ranges)) { const s = rangeScore(waistCm, lo, hi); if (s < bestScore) { best = Number(n); bestScore = s; } }
+  return best > RETAIL_MAX ? `${RETAIL_MAX}+` : best;
+}
+
+/** Everything for one person: tops / bottoms letter / trouser number for men and women. */
+export function recommendSizeSet(m) {
+  const out = {};
+  for (const g of ['men', 'women']) {
+    out[g] = { tops: recommendSize(m, 'tops', g).size, bottoms: recommendSize(m, 'bottoms', g).size, trousers_fr: trouserFR(m.waist_cm, g) };
+  }
+  return out;
 }
 
 function mapRanges(chart, key) {

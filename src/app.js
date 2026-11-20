@@ -2,7 +2,7 @@
  * app.js — Size Scan page: camera, MediaPipe Pose, guidance, result.
  * The measuring maths lives in estimator.js.
  */
-import { checkPose, frontWidths, sideDepths, combine, recommendSize } from './estimator.js';
+import { checkPose, frontWidths, sideDepths, combine, recommendSize, trouserFR, predictHeight, heightCalibration } from './estimator.js';
 import { T } from './i18n.js';
 
 const MP_VERSION = '0.10.35';
@@ -14,11 +14,17 @@ const SKIP_SIDE_AFTER_MS = 20000;
 
 const $ = (id) => document.getElementById(id);
 const S = {
-  lang: 'en', height: 175, landmarker: null, mode: null,
+  lang: 'en', height: 175, landmarker: null, mode: null, gender: 'men', hcal: null, calibrateCm: null, heightPred: null,
   stream: null, rotate: 0, mirror: true, running: false, raf: 0,
   stage: 'front', stable: 0, fronts: [], sides: [], frontVis: null, sideVis: null, stageStart: 0, pause: 0,
 };
-const t = (k) => T[S.lang][k] ?? T.en[k];
+const t = (k) => T[S.lang][k] ?? T.en[k] ?? EXTRA[S.lang]?.[k] ?? EXTRA.en[k];
+// text added 2026-11-20 (gender, trousers, auto height)
+const EXTRA = {
+  en: { men: 'Men', women: 'Women', trousers: 'Trousers (FR)', hAuto: (h) => `Height estimated: ${h} cm`, hCalOk: (h) => `Camera calibrated for auto height (${h} cm). Keep the camera and the floor mark where they are.` },
+  fr: { men: 'Homme', women: 'Femme', trousers: 'Pantalon (FR)', hAuto: (h) => `Taille estimée : ${h} cm`, hCalOk: (h) => `Caméra calibrée pour la taille auto (${h} cm). Ne bougez plus la caméra ni le repère au sol.` },
+  ar: { men: 'رجال', women: 'نساء', trousers: 'سروال (مقاس فرنسي)', hAuto: (h) => `الطول المقدّر: ${h} سم`, hCalOk: (h) => `تمت معايرة الكاميرا لتقدير الطول (${h} سم). لا تحرّك الكاميرا ولا علامة الأرض.` },
+};
 
 // ── language, theme, height ────────────────────────────────────────────────
 function setLang(l) {
@@ -217,9 +223,24 @@ function loop() {
 function finish(skipSide = false) {
   stopScan();
   status(t('measuring'));
+  let note = '';
+  // calibration scan (?calibrate=183): the known height -> cm per pixel for this fixed camera
+  if (S.calibrateCm) {
+    const cal = heightCalibration(S.fronts, S.calibrateCm);
+    if (cal) { S.hcal = cal; try { localStorage.setItem('ss.hcal', JSON.stringify(cal)); } catch {} setHeight(S.calibrateCm); note = t('hCalOk')(S.calibrateCm) + ' '; }
+  } else if (S.hcal) {
+    // auto height: widths scale linearly with the height used, so rescale instead of re-measuring
+    const pred = predictHeight(S.fronts, S.hcal);
+    if (pred) {
+      const k = pred / S.height;
+      for (const f of S.fronts) for (const key of ['shoulder', 'chest', 'waist', 'hip']) if (f[key] != null) f[key] *= k;
+      for (const d of S.sides) if (d) for (const key of ['chest', 'waist', 'hip']) d[key] *= k;
+      setHeight(pred); S.heightPred = pred; note = t('hAuto')(pred) + '. ';
+    }
+  }
   const m = combine(S.fronts, skipSide ? [] : S.sides, S.height);
   if (!m) { status(t('failed'), 'err'); return; }
-  S.lastResult = { m, frontVis: S.frontVis, sideVis: skipSide ? null : S.sideVis, note: '' };
+  S.lastResult = { m, frontVis: S.frontVis, sideVis: skipSide ? null : S.sideVis, note };
   renderResult(S.lastResult);
   show('result');
 }
@@ -313,15 +334,31 @@ function paintSilhouette(target, vis) {
 function renderResult({ m, frontVis, sideVis, note }) {
   const cats = [['tops', 'tops'], ['bottoms', 'bottoms'], ['one-pieces', 'onepiece']];
   $('sizes').innerHTML = '';
+  // men / women chart switch
+  let gsw = $('genderSw');
+  if (!gsw) {
+    gsw = document.createElement('div'); gsw.id = 'genderSw'; gsw.className = 'langs'; gsw.style.margin = '0 0 14px';
+    $('sizes').before(gsw);
+  }
+  gsw.innerHTML = ['men', 'women'].map((g) => `<button data-g="${g}" aria-pressed="${S.gender === g}" style="${S.gender === g ? 'color:var(--ink);border-color:var(--faint)' : ''}">${t(g)}</button>`).join('');
+  gsw.onclick = (e) => { const b = e.target.closest('[data-g]'); if (!b) return; S.gender = b.dataset.g; try { localStorage.setItem('ss.gender', S.gender); } catch {} renderResult(S.lastResult); };
   let conf = 'none';
   for (const [cat, key] of cats) {
-    const r = recommendSize(m, cat);
+    if (cat === 'one-pieces' && S.gender === 'men') continue;
+    const r = recommendSize(m, cat, S.gender);
     if (cat === 'tops') conf = r.confidence;
     const li = document.createElement('li');
     li.innerHTML = `<span class="k"></span><span class="big"></span><span class="alt"></span>`;
     li.querySelector('.k').textContent = t(key);
     li.querySelector('.big').textContent = r.size || '–';
     li.querySelector('.alt').textContent = r.alternative ? t('orAlt')(r.alternative) : '';
+    $('sizes').append(li);
+  }
+  { // French trouser number (36..48, "48+" above)
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="k"></span><span class="big"></span><span class="alt"></span>`;
+    li.querySelector('.k').textContent = t('trousers');
+    li.querySelector('.big').textContent = trouserFR(m.waist_cm, S.gender) ?? '–';
     $('sizes').append(li);
   }
   const rows = [['chest', m.chest_cm], ['waist', m.waist_cm], ['hips', m.hip_cm], ['shoulders', m.shoulder_cm]];
@@ -389,6 +426,7 @@ function measurePhotosNow() {
   }
   const m = combine([fw], sd ? [sd] : [], S.height);
   S.lastResult = { m, frontVis: snapshotSilhouette(f.mask, fc.width, fc.height, fw.segs), sideVis, note };
+  S.lastResult.m.frontPxH = fw.pxH;
   photoMsg('');
   renderResult(S.lastResult);
   show('result');
@@ -402,7 +440,13 @@ function init() {
     height = Number(localStorage.getItem('ss.height')) || 175;
     theme = localStorage.getItem('ss.theme');
   } catch {}
+  try { S.hcal = JSON.parse(localStorage.getItem('ss.hcal') || 'null'); S.gender = localStorage.getItem('ss.gender') || 'men'; } catch {}
   const q = new URLSearchParams(location.search);
+  // ?calibrate=183  -> next scan calibrates auto height for this fixed camera (person of known height)
+  // ?auto=0         -> forget the calibration, always use the typed height
+  if (q.get('calibrate')) S.calibrateCm = Math.max(140, Math.min(210, Number(q.get('calibrate')) || 0)) || null;
+  if (q.get('auto') === '0') { S.hcal = null; try { localStorage.removeItem('ss.hcal'); } catch {} }
+  if (q.get('g') === 'women' || q.get('g') === 'men') S.gender = q.get('g');
   if (q.get('lang')) lang = q.get('lang');
   if (q.get('theme')) theme = q.get('theme');
   setTheme(theme === 'light' || theme === 'dark' ? theme : null);
