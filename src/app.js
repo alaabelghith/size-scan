@@ -2,7 +2,7 @@
  * app.js — Size Scan page: camera, MediaPipe Pose, guidance, result.
  * The measuring maths lives in estimator.js.
  */
-import { checkPose, frontWidths, sideDepths, combine, recommendSize, trouserFR, predictHeight, heightCalibration } from './estimator.js';
+import { checkPose, frontWidths, sideDepths, combine, recommendSize, trouserFR, predictHeight, heightCalibration, heightFrom } from './estimator.js';
 import { T } from './i18n.js';
 
 const MP_VERSION = '0.10.35';
@@ -159,7 +159,7 @@ async function startScan() {
   loop();
 }
 function resetScan() {
-  Object.assign(S, { stage: 'front', stable: 0, fronts: [], sides: [], frontVis: null, sideVis: null, stageStart: performance.now(), pause: 0 });
+  Object.assign(S, { calSamples: [], lastFy: null, stage: 'front', stable: 0, fronts: [], sides: [], frontVis: null, sideVis: null, stageStart: performance.now(), pause: 0 });
   setStage('front');
   $('skipSide').hidden = true;
   setProgress(0);
@@ -191,7 +191,18 @@ function loop() {
   if (now < S.pause) return;
 
   const w = frame.width, h = frame.height;
-  const chk = checkPose(landmarks, S.stage, w, h);
+  let chk = checkPose(landmarks, S.stage, w, h);
+  if (landmarks && S.stage === 'front') {
+    const la = landmarks[27], ra = landmarks[28], fy = (la.y + ra.y) / 2;
+    // calibration: every frame with the feet visible (walking in) helps find the horizon line
+    if (S.calibrateCm && (la.visibility ?? 1) > 0.5 && (ra.visibility ?? 1) > 0.5) {
+      const ey = (landmarks[2].y + landmarks[5].y) / 2;
+      S.calSamples.push({ pxHn: (fy - ey) / 0.897, feetY: fy });
+    }
+    // count only still frames (feet planted): walking in gives wrong heights and widths
+    if (chk.ok && S.lastFy != null && Math.abs(fy - S.lastFy) > 0.006) chk = { ok: false, msg: 'hold' };
+    S.lastFy = fy;
+  }
   if (!chk.ok) {
     S.stable = 0;
     if (S.stage === 'front') S.fronts = []; else S.sides = [];
@@ -200,7 +211,11 @@ function loop() {
   } else {
     S.stable++;
     status(t('hold'), 'ok');
-    if (S.stage === 'front') S.fronts.push(frontWidths(landmarks, mask, w, h, S.height));
+    if (S.stage === 'front') {
+      const fw = frontWidths(landmarks, mask, w, h, S.height);
+      S.fronts.push(fw);
+      if (S.hcal && !S.calibrateCm) { const hl = predictHeight(S.fronts, S.hcal); if (hl) $('heightVal').value = hl; }   // live auto height
+    }
     else S.sides.push(sideDepths(landmarks, mask, w, h, S.height));
     setProgress(S.stable / STABLE_FRAMES);
   }
@@ -226,8 +241,8 @@ function finish(skipSide = false) {
   let note = '';
   // calibration scan (?calibrate=183): the known height -> cm per pixel for this fixed camera
   if (S.calibrateCm) {
-    const cal = heightCalibration(S.fronts, S.calibrateCm);
-    if (cal) { S.hcal = cal; try { localStorage.setItem('ss.hcal', JSON.stringify(cal)); } catch {} setHeight(S.calibrateCm); note = t('hCalOk')(S.calibrateCm) + ' '; }
+    const cal = heightCalibration(S.fronts, S.calibrateCm, S.calSamples);
+    if (cal) { S.hcal = cal; try { localStorage.setItem('ss.hcal', JSON.stringify(cal)); } catch {} setHeight(S.calibrateCm); note = t('hCalOk')(S.calibrateCm) + ' '; S.calibrateCm = null; }
   } else if (S.hcal) {
     // auto height: widths scale linearly with the height used, so rescale instead of re-measuring
     const pred = predictHeight(S.fronts, S.hcal);

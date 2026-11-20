@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {
   ellipseCircumference, rowWidthPx, recommendSize, recommendSizeSet, trouserFR, frontWidths, combine,
-  checkPose, predictHeight, heightCalibration, percentile, LM,
+  checkPose, predictHeight, heightCalibration, fitHorizon, heightFrom, percentile, LM,
 } from '../src/estimator.js';
 
 // 1. a circle of radius 15 cm
@@ -49,6 +49,11 @@ assert.ok(m.chest_cm > 60 && m.chest_cm < 140);
 // 5. auto height: calibrate on this person, predict it back
 const cal = heightCalibration([fw], 178);
 assert.equal(predictHeight([fw], cal), 178);
+// ground model: one person seen at several distances (horizon at 0.45) -> the distance cancels
+const walk = Array.from({ length: 20 }, (_, i) => { const fy = 0.75 + i * 0.005; return { pxHn: 2.0 * (fy - 0.45), pxH: 2000 * (fy - 0.45), feetY: fy }; });
+assert.ok(Math.abs(fitHorizon(walk) - 0.45) < 1e-6);
+const cal2 = heightCalibration([walk[5]], 183, walk);
+assert.equal(Math.round(heightFrom(walk[15], cal2)), 183);   // closer to the camera, same height
 
 // 6. pose guidance: front needs the arms away from the body
 assert.equal(checkPose(pts, 'front', FW, FH).msg, 'arms');          // no wrists visible

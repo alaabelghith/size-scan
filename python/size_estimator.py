@@ -76,7 +76,7 @@ DEFAULT_DEPTH_RATIO = {"chest": 0.70, "waist": 0.75, "hip": 0.72}
 # Plausible circumference / stature ratios for adults; outside -> clamp + low confidence.
 STATURE_BOUNDS = {"chest": (0.45, 0.78), "waist": (0.36, 0.72), "hip": (0.47, 0.80)}
 # A-pose check: wrists must be at least this far (cm) outside the hip edge.
-ARM_GAP_CM = 10.0
+ARM_GAP_CM = 8.0
 # Vertical position of chest/waist lines as a fraction of the
 # shoulder->hip span (0 = shoulder line, 1 = hip line).
 CHEST_FRAC = 0.18
@@ -449,7 +449,10 @@ class SizeEstimator:
                     return False, "Face the camera, arms slightly out"
             return True, "Hold still..."
         else:  # profile
-            if shoulder_w > fd.w * 0.12:      # 2026-11-20: 0.09 rejected big bodies already in profile
+            # 2026-11-20 v2: judge the turn by the body itself, not the frame width: facing the camera the
+            # shoulders are ~0.8-1.0 x the shoulder->hip length, in profile < ~0.4 (camera distance cancels)
+            torso = abs(((lm[LEFT_HIP][1] + lm[RIGHT_HIP][1]) - (lm[LEFT_SHOULDER][1] + lm[RIGHT_SHOULDER][1])) / 2.0)
+            if shoulder_w > max(fd.w * 0.05, 0.42 * torso):
                 return False, "Turn 90° to your side"
             if not (lm[LEFT_SHOULDER][2] > VIS_MIN or lm[RIGHT_SHOULDER][2] > VIS_MIN):
                 return False, "Turn 90° to your side"
@@ -521,15 +524,13 @@ class SizeEstimator:
         out["chest"] = float(np.median(ch)) * scale
         out["waist"] = float(min(wa)) * scale
         out["hip"] = float(np.percentile(hp, 30)) * scale
-        # auto height (2026-11-20): head top = first mask row above the nose column, floor = ankle + 3.9 %
-        nx = int(min(f.w - 1, max(0, lm[NOSE][0])))
-        col = f.mask[:, max(0, nx - 3):nx + 4].max(axis=1) > 0.5
-        rows = np.where(col)[0]
+        # auto height (2026-11-20 v2): person height in px from the landmarks only (eye -> ankle is
+        # 89.7 % of stature). The mask head-top jumped by 20 % between frames (hair / holes).
+        eye_y = (lm[LEFT_EYE][1] + lm[RIGHT_EYE][1]) / 2.0
         ankle_y = (lm[LEFT_ANKLE][1] + lm[RIGHT_ANKLE][1]) / 2.0
-        if rows.size:
-            top = float(rows[0])
-            out["px_h"] = (ankle_y - top) / (1 - ANKLE_HEIGHT_FRAC)
-            out["feet_y"] = ankle_y / f.h
+        out["px_h"] = (ankle_y - eye_y) / (EYE_HEIGHT_FRAC - ANKLE_HEIGHT_FRAC)
+        out["feet_y"] = ankle_y / f.h
+        out["px_h_n"] = out["px_h"] / f.h
         return out
 
     def _profile_depths(self, p, height_cm):
@@ -564,22 +565,33 @@ class SizeEstimator:
             return None
         return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
 
+    @staticmethod
+    def height_from(fw, ah):
+        """cm from one front measurement. Ground model (fixed camera): a person's size in the image
+        is proportional to how far below the horizon line (yh) their feet are, so distance cancels:
+        H = k * px_h_n / (feet_y - yh). Without yh: plain cm-per-pixel (needs the floor mark)."""
+        if not fw or not ah:
+            return None
+        if ah.get("yh") is not None and ah.get("k") and fw.get("px_h_n") and fw["feet_y"] - ah["yh"] > 0.02:
+            return float(ah["k"]) * fw["px_h_n"] / (fw["feet_y"] - float(ah["yh"]))
+        if ah.get("cm_per_px") and fw.get("px_h"):
+            return fw["px_h"] * float(ah["cm_per_px"])
+        return None
+
     def predict_height(self):
         """cm from the front frames, needs sizing.auto_height.cm_per_px (fixed camera, shopper on the
         floor marker). Corrected by how far the feet are from the calibration spot (feet_y)."""
         ah = getattr(self, "auto_height", None) or {}
-        k = ah.get("cm_per_px")
-        if not k or not self.front_frames:
+        if not self.front_frames or not (ah.get("k") or ah.get("cm_per_px")):
             return None
         rows = [self._front_widths(f, 170.0) for f in self.front_frames]
-        rows = [r for r in rows if r and r.get("px_h")]
-        if not rows:
+        hs = [self.height_from(r, ah) for r in rows if r]
+        hs = [h for h in hs if h]
+        if not hs:
             return None
-        px = float(np.median([r["px_h"] for r in rows]))
-        fy = float(np.median([r["feet_y"] for r in rows]))
-        # nearer the camera = feet lower in frame = person bigger in px -> shrink, and the reverse
-        corr = 1.0 - float(ah.get("feet_k", 0.0)) * (fy - float(ah.get("feet_y", fy)))
-        return round(px * k * corr, 1), px, fy
+        px = float(np.median([r["px_h"] for r in rows if r]))
+        fy = float(np.median([r["feet_y"] for r in rows if r]))
+        return round(float(np.median(hs)), 1), px, fy
 
     def compute(self, height_cm: float) -> dict:
         """Combine the stored front (+ profile) captures into measurements.

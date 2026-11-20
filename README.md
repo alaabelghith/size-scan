@@ -29,10 +29,10 @@ Without a side view, the depth is assumed from average depth/width ratios, and c
 
 One camera cannot know absolute size, so height is typed in by default. For a **fixed** setup (kiosk, shop mirror, a phone on a tripod) the height can be estimated for everyone:
 
-1. Put a mark on the floor where people stand. Do not move the camera after this.
-2. Open the page with `?calibrate=183` (the real height of the person scanning) and do one scan. The page stores centimetres per pixel for this camera.
-3. From then on every scan estimates the height from the silhouette (head top to floor) and shows "Height estimated". Standing off the mark by 20–30 cm moves the estimate by roughly 5–10 cm.
-4. `?auto=0` forgets the calibration.
+1. Fix the camera. Do not move it after this.
+2. Open the page with `?calibrate=183` (the real height of the person scanning). Walk in from a few steps back, stop, and do one scan. The walk-in frames give the camera's horizon line; the scan gives the scale.
+3. From then on every scan estimates the height live (the height field updates) from the body points: eye-to-ankle distance, corrected by where the feet are in the image (the further below the horizon, the closer the person), so people do not have to stand on an exact spot. Tested on the Fashion Mirror kiosk: 180 and 184 cm for a 183 cm person at two distances (about ±2 %).
+4. Only still frames count (feet planted). `?auto=0` forgets the calibration. Moving the camera = calibrate again.
 
 ## Run it locally
 

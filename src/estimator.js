@@ -189,7 +189,10 @@ export function checkPose(landmarks, view, w, h) {
     }
     return { ok: true, msg: 'hold' };
   }
-  if (shoulderW > w * 0.12) return { ok: false, msg: 'turn' };
+  // judge the turn by the body itself: facing the camera the shoulders are ~0.8-1.0 x the
+  // shoulder->hip length, in profile < ~0.4 (the camera distance cancels)
+  const torso = Math.abs((lh.y + rh.y) / 2 - (ls.y + rs.y) / 2);
+  if (shoulderW > Math.max(w * 0.05, 0.42 * torso)) return { ok: false, msg: 'turn' };
   if (!(ls.v > VIS_MIN || rs.v > VIS_MIN)) return { ok: false, msg: 'turn' };
   return { ok: true, msg: 'hold' };
 }
@@ -270,14 +273,12 @@ export function frontWidths(landmarks, mask, w, h, heightCm) {
   const B = mask ? measureBands(G, mask, w, h, true) : null;
   if (B) {
     Object.assign(res, { usedMask: true, chest: B.chest, waist: B.waist, hip: B.hip, segs: B.segs });
-    // head top = first mask row in the nose column; floor = ankle + ankle height
-    const msx = mask.width / w, msy = mask.height / h;
-    const nx = Math.round(Math.min(w - 1, Math.max(0, landmarks[LM.NOSE].x * w)) * msx);
-    for (let yy = 0; yy < mask.height; yy++) {
-      let hit = false;
-      for (let dx = -3; dx <= 3 && !hit; dx++) { const xx = nx + dx; if (xx >= 0 && xx < mask.width && mask.data[yy * mask.width + xx] > 0.5) hit = true; }
-      if (hit) { res.pxH = (G.ankleY - yy / msy) / (1 - ANKLE_HEIGHT_FRAC); res.feetY = G.ankleY / h; break; }
-    }
+    // person height in px from the landmarks only (eye -> ankle = 89.7 % of stature); the mask
+    // head-top jumped by ~20 % between frames (hair, holes)
+    const eyeY = (landmarks[LM.LEFT_EYE].y + landmarks[LM.RIGHT_EYE].y) / 2 * h;
+    res.pxH = (G.ankleY - eyeY) / (EYE_HEIGHT_FRAC - ANKLE_HEIGHT_FRAC);
+    res.pxHn = res.pxH / h;
+    res.feetY = G.ankleY / h;
   } else {
     const s = G.shoulderWpx * G.scale;
     Object.assign(res, { chest: s * 0.86, waist: s * 0.74, hip: G.hipWpxLm * G.scale * 1.35 });
@@ -293,24 +294,50 @@ export function sideDepths(landmarks, mask, w, h, heightCm) {
 }
 
 /**
- * Auto height for a FIXED camera: the person stands on a floor marker, and one calibration
- * scan of someone with a known height gives cm per pixel. Feet lower in the frame = closer.
- * @param {Array} fronts  frontWidths() results (any height used)
- * @param {{cmPerPx:number, feetY?:number, feetK?:number}} cal
+ * Auto height for a FIXED camera.
+ * Ground model: a person's size in the image is proportional to how far below the horizon line
+ * (yh, normalised) their feet are, so the distance to the camera cancels:
+ *     H = k * pxHn / (feetY - yh)
+ * Fallback without yh: cm per pixel (then everyone must stand on the same floor mark).
+ * @param {Array} fronts  frontWidths() results
+ * @param {{k?:number, yh?:number, cmPerPx?:number}} cal
  */
+export function heightFrom(f, cal) {
+  if (!f || !cal) return null;
+  if (cal.yh != null && cal.k && f.pxHn && f.feetY - cal.yh > 0.02) return cal.k * f.pxHn / (f.feetY - cal.yh);
+  if (cal.cmPerPx && f.pxH) return f.pxH * cal.cmPerPx;
+  return null;
+}
 export function predictHeight(fronts, cal) {
-  if (!cal || !cal.cmPerPx) return null;
-  const px = median(fronts.map((f) => f.pxH)), fy = median(fronts.map((f) => f.feetY));
-  if (!px) return null;
-  const corr = 1 - (cal.feetK || 0) * (fy - (cal.feetY ?? fy));
-  const cm = Math.round(px * cal.cmPerPx * corr);
-  return cm >= 140 && cm <= 210 ? cm : null;
+  const cm = median(fronts.map((f) => heightFrom(f, cal)));
+  if (!cm) return null;
+  return cm >= 140 && cm <= 210 ? Math.round(cm) : null;
 }
 
-/** Calibration for predictHeight from the fronts of one scan of a person of known height. */
-export function heightCalibration(fronts, knownCm) {
-  const px = median(fronts.map((f) => f.pxH)), fy = median(fronts.map((f) => f.feetY));
-  return px ? { cmPerPx: knownCm / px, feetY: fy, feetK: 0 } : null;
+/** Horizon line yh from frames of one person at different distances (pxHn = c * (feetY - yh)). */
+export function fitHorizon(samples) {
+  const pts = samples.filter((p) => p && p.pxHn && p.feetY);
+  if (pts.length < 10) return null;
+  const xs = pts.map((p) => p.feetY), ys = pts.map((p) => p.pxHn);
+  const mx = xs.reduce((a, b) => a + b, 0) / xs.length, my = ys.reduce((a, b) => a + b, 0) / ys.length;
+  let sxx = 0, sxy = 0;
+  for (let i = 0; i < xs.length; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (ys[i] - my); }
+  if (Math.max(...xs) - Math.min(...xs) < 0.03 || sxx === 0) return null;   // needs ~a step of distance change
+  const c = sxy / sxx, yh = mx - my / c;
+  return c > 0 && yh > -0.5 && yh < Math.min(...xs) - 0.05 ? yh : null;
+}
+
+/** Calibration from a scan of a person of known height (+ optional walk-in samples for the horizon). */
+export function heightCalibration(fronts, knownCm, samples = []) {
+  const px = median(fronts.map((f) => f.pxH));
+  if (!px) return null;
+  const cal = { cmPerPx: knownCm / px };
+  const yh = fitHorizon([...samples, ...fronts]);
+  if (yh != null) {
+    const r = median(fronts.filter((f) => f.feetY - yh > 0.02).map((f) => f.pxHn / (f.feetY - yh)));
+    if (r) Object.assign(cal, { yh, k: knownCm / r });
+  }
+  return cal;
 }
 
 /**
